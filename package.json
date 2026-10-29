@@ -1,0 +1,20 @@
+{
+  "name": "cf-email-gateway",
+  "version": "0.1.0",
+  "description": "Cloudflare Email Routing gateway: inbound mail to per-agent queues, outbox queue to send_email",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "check": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260922.1",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4",
+    "wrangler": "^4.38.0"
+  }
+}
