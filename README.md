@@ -48,8 +48,9 @@ Examples:
 | `Hermes.Bot+x@Example.ORG` | `mail-hermes-bot-x-example-org` |
 | 70 × `a` + `@example.org` | `mail-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-0ffad590` |
 
-New queues get one consumer of type `http_pull` with
-`visibility_timeout_ms = 120000` and `max_retries = 5`.
+Every inbound queue gets one consumer of type `http_pull` with
+`visibility_timeout_ms = 120000` and `max_retries = 5`; the Worker adds it on
+the next email whenever it finds the queue without a consumer.
 
 ### Inbound queue message
 

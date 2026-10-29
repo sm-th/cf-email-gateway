@@ -6,6 +6,7 @@ const ACCOUNT = "acc123";
 const TOKEN = "token-xyz";
 const NOW = "2026-10-29T08:00:00.000Z";
 const UUID = "11111111-2222-4333-8444-555555555555";
+const PULL = [{ type: "http_pull" }];
 const RAW = "From: author@example.com\r\nTo: hermes@example.org\r\nSubject: hi\r\n\r\nhello\r\n";
 
 interface ApiRequest {
@@ -17,10 +18,11 @@ interface ApiRequest {
 
 /** In-memory Cloudflare Queues API served through a stubbed global fetch. */
 function fakeCloudflare(options: {
-  queues?: { queue_id: string; queue_name: string }[];
+  queues?: { queue_id: string; queue_name: string; consumers?: { type: string }[] }[];
   /** Another isolate creates the queue right before our create call. */
   createConflict?: boolean;
   pushError?: string;
+  consumerError?: string;
 }) {
   const queues = [...(options.queues ?? [])];
   const requests: ApiRequest[] = [];
@@ -39,16 +41,21 @@ function fakeCloudflare(options: {
       requests.push({ method, path, body, authorization: new Headers(init.headers).get("authorization") });
 
       if (method === "GET" && path === "/queues") return reply(200, queues);
+      const consumersPath = /^\/queues\/([^/]+)\/consumers$/.exec(path);
+      if (method === "POST" && consumersPath) {
+        if (options.consumerError) return reply(500, null, [{ code: 10001, message: options.consumerError }]);
+        queues.find((q) => q.queue_id === consumersPath[1])?.consumers?.push({ type: body.type });
+        return reply(200, { consumer_id: "c1" });
+      }
       if (method === "POST" && path === "/queues") {
         if (options.createConflict) {
-          queues.push({ queue_id: "q-other", queue_name: body.queue_name });
+          queues.push({ queue_id: "q-other", queue_name: body.queue_name, consumers: [{ type: "http_pull" }] });
           return reply(409, null, [{ code: 11009, message: "A queue with this name already exists" }]);
         }
-        const created = { queue_id: "q-new", queue_name: body.queue_name };
+        const created = { queue_id: "q-new", queue_name: body.queue_name, consumers: [] };
         queues.push(created);
         return reply(200, created);
       }
-      if (method === "POST" && /^\/queues\/[^/]+\/consumers$/.test(path)) return reply(200, { consumer_id: "c1" });
       if (method === "POST" && /^\/queues\/[^/]+\/messages$/.test(path)) {
         return options.pushError ? reply(500, null, [{ code: 10001, message: options.pushError }]) : reply(200, null);
       }
@@ -115,7 +122,7 @@ describe("email handler", () => {
   });
 
   it("stores the message and pushes the contract body to an existing queue", async () => {
-    const requests = fakeCloudflare({ queues: [{ queue_id: "q-hermes", queue_name: "mail-hermes-example-org" }] });
+    const requests = fakeCloudflare({ queues: [{ queue_id: "q-hermes", queue_name: "mail-hermes-example-org", consumers: PULL }] });
     const { objects, bucket } = fakeBucket();
     const message = inboundEmail("Hermes@Example.org");
 
@@ -152,7 +159,7 @@ describe("email handler", () => {
   });
 
   it("caches the queue id so later emails skip the lookup", async () => {
-    const requests = fakeCloudflare({ queues: [{ queue_id: "q-cache", queue_name: "mail-cache-example-org" }] });
+    const requests = fakeCloudflare({ queues: [{ queue_id: "q-cache", queue_name: "mail-cache-example-org", consumers: PULL }] });
     const { bucket } = fakeBucket();
 
     await receive(inboundEmail("cache@example.org"), env(bucket));
@@ -186,6 +193,47 @@ describe("email handler", () => {
     expect(message.setReject).not.toHaveBeenCalled();
   });
 
+  it("adds the missing http_pull consumer to an existing queue and caches only afterwards", async () => {
+    const requests = fakeCloudflare({ queues: [{ queue_id: "q-bare", queue_name: "mail-bare-example-org", consumers: [] }] });
+    const { bucket } = fakeBucket();
+
+    await receive(inboundEmail("bare@example.org"), env(bucket));
+    await receive(inboundEmail("bare@example.org"), env(bucket));
+
+    expect(requests.map((r) => [r.method, r.path, r.body])).toEqual([
+      ["GET", "/queues", undefined],
+      [
+        "POST",
+        "/queues/q-bare/consumers",
+        { type: "http_pull", settings: { visibility_timeout_ms: 120000, max_retries: 5 } },
+      ],
+      ["POST", "/queues/q-bare/messages", expect.anything()],
+      ["POST", "/queues/q-bare/messages", expect.anything()],
+    ]);
+  });
+
+  it("retries the consumer setup on the next email when adding it failed", async () => {
+    const queues = [{ queue_id: "q-flaky", queue_name: "mail-flaky-example-org", consumers: [] as { type: string }[] }];
+    const requests = fakeCloudflare({ queues, consumerError: "temporary outage" });
+    const { bucket } = fakeBucket();
+    const first = inboundEmail("flaky@example.org");
+
+    await receive(first, env(bucket));
+    expect(first.setReject).toHaveBeenCalledOnce();
+
+    const requests2 = fakeCloudflare({ queues });
+    const second = inboundEmail("flaky@example.org");
+    await receive(second, env(bucket));
+
+    expect(second.setReject).not.toHaveBeenCalled();
+    expect(requests.filter((r) => r.path.endsWith("/messages"))).toEqual([]);
+    expect(requests2.map((r) => `${r.method} ${r.path}`)).toEqual([
+      "GET /queues",
+      "POST /queues/q-flaky/consumers",
+      "POST /queues/q-flaky/messages",
+    ]);
+  });
+
   it("uses the queue created concurrently by another isolate when create conflicts", async () => {
     const requests = fakeCloudflare({ createConflict: true });
     const { objects, bucket } = fakeBucket();
@@ -205,7 +253,7 @@ describe("email handler", () => {
 
   it("deletes the stored object and rejects when the push fails", async () => {
     fakeCloudflare({
-      queues: [{ queue_id: "q-fail", queue_name: "mail-fail-example-org" }],
+      queues: [{ queue_id: "q-fail", queue_name: "mail-fail-example-org", consumers: PULL }],
       pushError: "Queue is overloaded",
     });
     const { objects, bucket } = fakeBucket();

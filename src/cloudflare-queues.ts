@@ -15,6 +15,7 @@ interface CloudflareEnvelope<T> {
 interface QueueInfo {
   queue_id: string;
   queue_name: string;
+  consumers?: { type?: string }[];
 }
 
 /** Queue ids by `<account>/<name>`, cached for the lifetime of the isolate. */
@@ -50,42 +51,49 @@ async function call<T>(
   return envelope;
 }
 
-async function findQueue(config: QueuesApiConfig, name: string): Promise<string | undefined> {
+async function findQueue(config: QueuesApiConfig, name: string): Promise<QueueInfo | undefined> {
   for (let page = 1; ; page++) {
     const { result, result_info } = await call<QueueInfo[]>(config, "GET", `/queues?page=${page}`);
     const match = result.find((q) => q.queue_name === name);
-    if (match) return match.queue_id;
+    if (match) return match;
     if (!result_info?.total_pages || page >= result_info.total_pages) return undefined;
   }
 }
 
 /**
- * Returns the id of queue `name`, creating it with an http_pull consumer when
- * it does not exist yet.
+ * Returns the id of queue `name`, creating it when missing and adding the
+ * http_pull consumer when the queue has none. Ids are cached only once the
+ * consumer is known to exist, so a half-finished setup is repaired by the
+ * next email.
  */
 export async function ensureQueue(config: QueuesApiConfig, name: string): Promise<string> {
   const cacheKey = `${config.accountId}/${name}`;
   const cached = queueIds.get(cacheKey);
   if (cached) return cached;
 
-  let id = await findQueue(config, name);
-  if (!id) {
+  let queue = await findQueue(config, name);
+  if (!queue) {
     try {
-      id = (await call<QueueInfo>(config, "POST", "/queues", { queue_name: name })).result.queue_id;
+      queue = (await call<QueueInfo>(config, "POST", "/queues", { queue_name: name })).result;
     } catch (createError) {
       // A concurrent first email may have created it between list and create.
-      id = await findQueue(config, name);
-      if (!id) throw createError;
-      queueIds.set(cacheKey, id);
-      return id;
+      queue = await findQueue(config, name);
+      if (!queue) throw createError;
     }
-    await call(config, "POST", `/queues/${id}/consumers`, {
-      type: "http_pull",
-      settings: { visibility_timeout_ms: 120000, max_retries: 5 },
-    });
   }
-  queueIds.set(cacheKey, id);
-  return id;
+  if (!queue.consumers?.length) {
+    try {
+      await call(config, "POST", `/queues/${queue.queue_id}/consumers`, {
+        type: "http_pull",
+        settings: { visibility_timeout_ms: 120000, max_retries: 5 },
+      });
+    } catch (consumerError) {
+      // A concurrent email may have added the consumer first.
+      if (!(await findQueue(config, name))?.consumers?.length) throw consumerError;
+    }
+  }
+  queueIds.set(cacheKey, queue.queue_id);
+  return queue.queue_id;
 }
 
 export async function pushMessage(config: QueuesApiConfig, queueId: string, body: unknown): Promise<void> {
