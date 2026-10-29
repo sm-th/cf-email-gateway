@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, type Mock, vi } from "vitest";
-import worker, { type Env } from "../src/index";
+import type { Env } from "../src/index";
 import { EmailMessage } from "./cloudflare-email";
 
 const ACCOUNT = "acc123";
@@ -7,7 +7,26 @@ const TOKEN = "token-xyz";
 const NOW = "2026-10-29T08:00:00.000Z";
 const UUID = "11111111-2222-4333-8444-555555555555";
 const PULL = [{ type: "http_pull" }];
+const WORKER_CONSUMER = {
+  type: "worker",
+  script_name: "cf-email-gateway",
+  dead_letter_queue: "email-outbox-dlq",
+  settings: { batch_size: 10, max_retries: 5 },
+};
+
+/** Fresh module per test, so the per-isolate queue id cache starts empty. */
+let worker: typeof import("../src/index").default;
+beforeEach(async () => {
+  vi.resetModules();
+  worker = (await import("../src/index")).default;
+});
 const RAW = "From: author@example.com\r\nTo: hermes@example.org\r\nSubject: hi\r\n\r\nhello\r\n";
+
+interface FakeQueue {
+  queue_id: string;
+  queue_name: string;
+  consumers?: { type: string }[];
+}
 
 interface ApiRequest {
   method: string;
@@ -18,13 +37,28 @@ interface ApiRequest {
 
 /** In-memory Cloudflare Queues API served through a stubbed global fetch. */
 function fakeCloudflare(options: {
-  queues?: { queue_id: string; queue_name: string; consumers?: { type: string }[] }[];
+  queues?: FakeQueue[];
+  /**
+   * State of email-outbox and email-outbox-dlq: "ready" (default) has both,
+   * the outbox with its Worker consumer; "bare" has both without consumers;
+   * "missing" has neither.
+   */
+  outbox?: "ready" | "bare" | "missing";
   /** Another isolate creates the queue right before our create call. */
   createConflict?: boolean;
   pushError?: string;
   consumerError?: string;
 }) {
-  const queues = [...(options.queues ?? [])];
+  const outbox = options.outbox ?? "ready";
+  const queues: FakeQueue[] = [
+    ...(outbox === "missing"
+      ? []
+      : [
+          { queue_id: "q-dlq", queue_name: "email-outbox-dlq", consumers: [] },
+          { queue_id: "q-outbox", queue_name: "email-outbox", consumers: outbox === "ready" ? [{ type: "worker" }] : [] },
+        ]),
+    ...(options.queues ?? []),
+  ];
   const requests: ApiRequest[] = [];
   const reply = (status: number, result: unknown, errors: { code: number; message: string }[] = []) =>
     new Response(JSON.stringify({ success: status < 400, errors, messages: [], result }), { status });
@@ -52,7 +86,7 @@ function fakeCloudflare(options: {
           queues.push({ queue_id: "q-other", queue_name: body.queue_name, consumers: [{ type: "http_pull" }] });
           return reply(409, null, [{ code: 11009, message: "A queue with this name already exists" }]);
         }
-        const created = { queue_id: "q-new", queue_name: body.queue_name, consumers: [] };
+        const created = { queue_id: `new-${body.queue_name}`, queue_name: body.queue_name, consumers: [] };
         queues.push(created);
         return reply(200, created);
       }
@@ -105,6 +139,12 @@ function env(bucket: unknown, send?: (m: EmailMessage) => Promise<unknown>): Env
   };
 }
 
+/** Drops the two outbox lookups that precede every first email in an isolate. */
+function afterOutboxLookups(requests: ApiRequest[]): ApiRequest[] {
+  expect(requests.slice(0, 2).map((r) => `${r.method} ${r.path}`)).toEqual(["GET /queues", "GET /queues"]);
+  return requests.slice(2);
+}
+
 async function receive(message: FakeInboundEmail, environment: Env) {
   await worker.email(message as unknown as ForwardableEmailMessage, environment);
 }
@@ -154,6 +194,7 @@ describe("email handler", () => {
         },
       },
     ]);
+    expect(requests.some((r) => r.method === "POST" && r.path.endsWith("/consumers"))).toBe(false);
     expect(requests.some((r) => r.method === "POST" && r.path === "/queues")).toBe(false);
     expect(message.setReject).not.toHaveBeenCalled();
   });
@@ -165,7 +206,7 @@ describe("email handler", () => {
     await receive(inboundEmail("cache@example.org"), env(bucket));
     await receive(inboundEmail("cache@example.org"), env(bucket));
 
-    expect(requests.map((r) => `${r.method} ${r.path}`)).toEqual([
+    expect(afterOutboxLookups(requests).map((r) => `${r.method} ${r.path}`)).toEqual([
       "GET /queues",
       "POST /queues/q-cache/messages",
       "POST /queues/q-cache/messages",
@@ -179,15 +220,15 @@ describe("email handler", () => {
 
     await receive(message, env(bucket));
 
-    expect(requests.map((r) => [r.method, r.path, r.body])).toEqual([
+    expect(afterOutboxLookups(requests).map((r) => [r.method, r.path, r.body])).toEqual([
       ["GET", "/queues", undefined],
       ["POST", "/queues", { queue_name: "mail-newbot-example-org" }],
       [
         "POST",
-        "/queues/q-new/consumers",
+        "/queues/new-mail-newbot-example-org/consumers",
         { type: "http_pull", settings: { visibility_timeout_ms: 120000, max_retries: 5 } },
       ],
-      ["POST", "/queues/q-new/messages", expect.objectContaining({ content_type: "json" })],
+      ["POST", "/queues/new-mail-newbot-example-org/messages", expect.objectContaining({ content_type: "json" })],
     ]);
     expect(objects.size).toBe(1);
     expect(message.setReject).not.toHaveBeenCalled();
@@ -200,7 +241,7 @@ describe("email handler", () => {
     await receive(inboundEmail("bare@example.org"), env(bucket));
     await receive(inboundEmail("bare@example.org"), env(bucket));
 
-    expect(requests.map((r) => [r.method, r.path, r.body])).toEqual([
+    expect(afterOutboxLookups(requests).map((r) => [r.method, r.path, r.body])).toEqual([
       ["GET", "/queues", undefined],
       [
         "POST",
@@ -234,6 +275,57 @@ describe("email handler", () => {
     ]);
   });
 
+  it("creates the outbox queues and the agent queue on the first email into an empty account", async () => {
+    const requests = fakeCloudflare({ outbox: "missing" });
+    const { bucket } = fakeBucket();
+    const message = inboundEmail("first@example.org");
+
+    await receive(message, env(bucket));
+
+    expect(requests.map((r) => [r.method, r.path, r.body])).toEqual([
+      ["GET", "/queues", undefined],
+      ["POST", "/queues", { queue_name: "email-outbox-dlq" }],
+      ["GET", "/queues", undefined],
+      ["POST", "/queues", { queue_name: "email-outbox" }],
+      ["POST", "/queues/new-email-outbox/consumers", WORKER_CONSUMER],
+      ["GET", "/queues", undefined],
+      ["POST", "/queues", { queue_name: "mail-first-example-org" }],
+      [
+        "POST",
+        "/queues/new-mail-first-example-org/consumers",
+        { type: "http_pull", settings: { visibility_timeout_ms: 120000, max_retries: 5 } },
+      ],
+      ["POST", "/queues/new-mail-first-example-org/messages", expect.objectContaining({ content_type: "json" })],
+    ]);
+    expect(message.setReject).not.toHaveBeenCalled();
+  });
+
+  it("adds the Worker consumer to an existing outbox queue that has none", async () => {
+    const requests = fakeCloudflare({
+      outbox: "bare",
+      queues: [{ queue_id: "q-agent", queue_name: "mail-agent-example-org", consumers: PULL }],
+    });
+    const { bucket } = fakeBucket();
+
+    await receive(inboundEmail("agent@example.org"), env(bucket));
+
+    expect(requests.filter((r) => r.path.endsWith("/consumers")).map((r) => [r.path, r.body])).toEqual([
+      ["/queues/q-outbox/consumers", WORKER_CONSUMER],
+    ]);
+  });
+
+  it("rejects the email when the outbox queue cannot be set up", async () => {
+    const requests = fakeCloudflare({ outbox: "bare", consumerError: "not allowed" });
+    const { objects, bucket } = fakeBucket();
+    const message = inboundEmail("agent@example.org");
+
+    await receive(message, env(bucket));
+
+    expect(message.setReject).toHaveBeenCalledOnce();
+    expect(objects.size).toBe(0);
+    expect(requests.some((r) => r.path.endsWith("/messages"))).toBe(false);
+  });
+
   it("uses the queue created concurrently by another isolate when create conflicts", async () => {
     const requests = fakeCloudflare({ createConflict: true });
     const { objects, bucket } = fakeBucket();
@@ -241,7 +333,7 @@ describe("email handler", () => {
 
     await receive(message, env(bucket));
 
-    expect(requests.map((r) => `${r.method} ${r.path}`)).toEqual([
+    expect(afterOutboxLookups(requests).map((r) => `${r.method} ${r.path}`)).toEqual([
       "GET /queues",
       "POST /queues",
       "GET /queues",

@@ -1,3 +1,4 @@
+# Must match WORKER_NAME in src/index.ts (the outbox queue consumer runs this script).
 name = "cf-email-gateway"
 main = "src/index.ts"
 compatibility_date = "2025-09-01"
@@ -7,12 +8,9 @@ compatibility_date = "2025-09-01"
 binding = "AGENT_MAIL"
 bucket_name = "email-agents"
 
-# Replies pushed by the unwrappers over the REST API; sent with EMAIL.
-[[queues.consumers]]
-queue = "email-outbox"
-max_batch_size = 10
-max_retries = 5
-dead_letter_queue = "email-outbox-dlq"
+# The Worker creates email-outbox (with itself as consumer), email-outbox-dlq
+# and the per-agent queues through the REST API on the first email; they are
+# not declared here so that deploying does not require them to exist.
 
 [[send_email]]
 name = "EMAIL"
