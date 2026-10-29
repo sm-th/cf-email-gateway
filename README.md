@@ -96,26 +96,32 @@ not be removed after a rejected delivery.
 
 ## Operator setup
 
-1. **R2**: create the bucket `email-agents` and add a lifecycle rule that
-   deletes objects after a few days, as a safety net for messages whose queue
-   entry expired unprocessed.
-2. **Queues**: create `email-outbox` and `email-outbox-dlq`. Per-agent
-   inbound queues are created automatically by the Worker.
-3. **Deploy**: either import this repository in **Workers & Pages → Create
+1. **Deploy**: either import this repository in **Workers & Pages → Create
    application → Import a repository** (Workers Builds; build command
-   `npm run check && npm test`, deploy command `npx wrangler deploy`), or run
-   `npm install && npx wrangler deploy` locally.
-4. **Secrets** (Worker → Settings → Variables and Secrets, type Secret, or
+   `npm run check && npm test`, deploy command `npm run deploy`), or run
+   `npm install && npm run deploy` locally.
+
+   `npm run deploy` first runs `scripts/provision.sh`, which creates whatever
+   is missing and leaves existing resources unchanged:
+   - queues `email-outbox` and `email-outbox-dlq`;
+   - R2 bucket `email-agents` with the lifecycle rule `expire-agent-mail`
+     (objects expire after 3 days, a safety net for mail whose queue entry
+     expired before an unwrapper pulled it).
+
+   The deploying token therefore needs Queues Edit and R2 Edit in addition to
+   Workers permissions. Per-agent inbound queues are created by the Worker on
+   the first email.
+2. **Secrets** (Worker → Settings → Variables and Secrets, type Secret, or
    `npx wrangler secret put <name>`):
    - `CF_ACCOUNT_ID`: the account id that owns the queues;
    - `CF_API_TOKEN`: an API token with **Queues Edit** on that account.
 
    Both are secrets rather than `[vars]`, so deployments do not reset them.
-5. **Observability**: Workers Logs are enabled in `wrangler.toml`.
-6. **Email Routing**: on the mail domain, add one custom address rule per
+3. **Observability**: Workers Logs are enabled in `wrangler.toml`.
+4. **Email Routing**: on the mail domain, add one custom address rule per
    whitelisted agent address with the action "Send to a Worker" →
    `cf-email-gateway`. Do not use a catch-all rule.
-7. **Recipients**: add every address that agents may reply to as a verified
+5. **Recipients**: add every address that agents may reply to as a verified
    destination address in Email Routing; `send_email` only delivers to
    verified addresses.
 
