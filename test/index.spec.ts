@@ -98,7 +98,7 @@ function inboundEmail(to: string): FakeInboundEmail {
 
 function env(bucket: unknown, send?: (m: EmailMessage) => Promise<unknown>): Env {
   return {
-    INBOX: bucket as R2Bucket,
+    AGENT_MAIL: bucket as R2Bucket,
     EMAIL: { send: vi.fn(send ?? (async () => ({}))) } as unknown as SendEmail,
     CF_ACCOUNT_ID: ACCOUNT,
     CF_API_TOKEN: TOKEN,
@@ -128,7 +128,7 @@ describe("email handler", () => {
 
     await receive(message, env(bucket));
 
-    const key = `inbox/mail-hermes-example-org/${NOW}-${UUID}.eml`;
+    const key = `mail-hermes-example-org/${NOW}-${UUID}.eml`;
     const stored = objects.get(key);
     expect(new TextDecoder().decode(stored?.bytes)).toBe(RAW);
     expect(stored?.options).toEqual({
@@ -262,7 +262,7 @@ describe("email handler", () => {
     await receive(message, env(bucket));
 
     expect(bucket.put).toHaveBeenCalledOnce();
-    expect(bucket.delete).toHaveBeenCalledWith(`inbox/mail-fail-example-org/${NOW}-${UUID}.eml`);
+    expect(bucket.delete).toHaveBeenCalledWith(`mail-fail-example-org/${NOW}-${UUID}.eml`);
     expect(objects.size).toBe(0);
     expect(message.setReject).toHaveBeenCalledOnce();
     const logged = vi.mocked(console.error).mock.calls.map(([line]) => JSON.parse(String(line)));

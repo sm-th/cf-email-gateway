@@ -2,10 +2,10 @@ name = "cf-email-gateway"
 main = "src/index.ts"
 compatibility_date = "2025-09-01"
 
-# Raw inbound .eml files, keyed inbox/<queue name>/<time>-<uuid>.eml.
+# Raw inbound .eml files, keyed <queue name>/<time>-<uuid>.eml.
 [[r2_buckets]]
-binding = "INBOX"
-bucket_name = "email-inbox"
+binding = "AGENT_MAIL"
+bucket_name = "email-agents"
 
 # Replies pushed by the unwrappers over the REST API; sent with EMAIL.
 [[queues.consumers]]
