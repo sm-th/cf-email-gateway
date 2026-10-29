@@ -3,7 +3,7 @@ import { ensureQueue, pushMessage, type QueuesApiConfig } from "./cloudflare-que
 import { queueName } from "./queue-name";
 
 export interface Env {
-  INBOX: R2Bucket;
+  AGENT_MAIL: R2Bucket;
   EMAIL: SendEmail;
   CF_ACCOUNT_ID: string;
   CF_API_TOKEN: string;
@@ -64,8 +64,8 @@ export default {
       const raw = new Uint8Array(await new Response(message.raw).arrayBuffer());
       const queue = await queueName(to);
       const receivedAt = new Date().toISOString();
-      const key = `inbox/${queue}/${receivedAt}-${crypto.randomUUID()}.eml`;
-      await env.INBOX.put(key, raw, {
+      const key = `${queue}/${receivedAt}-${crypto.randomUUID()}.eml`;
+      await env.AGENT_MAIL.put(key, raw, {
         httpMetadata: { contentType: "message/rfc822" },
         customMetadata: { from, to },
       });
@@ -79,7 +79,7 @@ export default {
     } catch (error) {
       if (r2Key) {
         try {
-          await env.INBOX.delete(r2Key);
+          await env.AGENT_MAIL.delete(r2Key);
         } catch (deleteError) {
           log("cleanup_failed", { r2Key, error: errorMessage(deleteError) });
         }
