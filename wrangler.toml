@@ -1,0 +1,29 @@
+name = "cf-email-gateway"
+main = "src/index.ts"
+compatibility_date = "2025-09-01"
+
+# Raw inbound .eml files, keyed inbox/<queue name>/<time>-<uuid>.eml.
+[[r2_buckets]]
+binding = "INBOX"
+bucket_name = "email-inbox"
+
+# Replies pushed by the unwrappers over the REST API; sent with EMAIL.
+[[queues.consumers]]
+queue = "email-outbox"
+max_batch_size = 10
+max_retries = 5
+dead_letter_queue = "email-outbox-dlq"
+
+[[send_email]]
+name = "EMAIL"
+
+[observability.logs]
+enabled = true
+invocation_logs = true
+
+[vars]
+# Cloudflare account id that owns the per-agent inbound queues.
+CF_ACCOUNT_ID = ""
+
+# Runtime secret configured with `wrangler secret put` or in the dashboard:
+#   CF_API_TOKEN  API token with "Queues Edit" on this account
