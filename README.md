@@ -11,7 +11,8 @@ Cloudflare Queues. Deploy one instance per mail domain.
   HTTP pull consumer on first use), and pushes a small reference message into
   that queue. If anything fails after the object was written, the object is
   deleted and the SMTP transaction is rejected.
-- **Outbound** (`queue` handler on `email-outbox`): decodes each finished
+- **Outbound** (`queue` handler on `email-outbox`, attached as the queue's
+  consumer by the Worker itself, see below): decodes each finished
   reply and sends it unchanged through the `send_email` binding. Malformed
   queue messages are logged and dropped; send failures are retried and end up
   in `email-outbox-dlq` after the retry limit.
@@ -51,6 +52,13 @@ Examples:
 Every inbound queue gets one consumer of type `http_pull` with
 `visibility_timeout_ms = 120000` and `max_retries = 5`; the Worker adds it on
 the next email whenever it finds the queue without a consumer.
+
+Before pushing, the Worker also ensures `email-outbox-dlq` (no consumer) and
+`email-outbox` with a Worker consumer: script `cf-email-gateway`, dead letter
+queue `email-outbox-dlq`, `batch_size = 10`, `max_retries = 5`. The outbox
+queues are not declared in `wrangler.toml`, so deploying does not require them
+to exist. Queue ids are cached per isolate, so these checks normally cost no
+API calls.
 
 ### Inbound queue message
 
@@ -96,18 +104,20 @@ not be removed after a rejected delivery.
 
 ## Operator setup
 
-1. **Account resources**, once per account before the first deployment:
+1. **R2 bucket**, once per account before the first deployment (the R2
+   binding must exist at deploy time):
 
    ```sh
-   npx wrangler queues create email-outbox
-   npx wrangler queues create email-outbox-dlq
    npx wrangler r2 bucket create email-agents
    npx wrangler r2 bucket lifecycle add email-agents expire-agent-mail --expire-days 3
    ```
 
    The lifecycle rule is a safety net for mail whose queue entry expired
-   before an unwrapper pulled it. Per-agent inbound queues are created by the
-   Worker on the first email.
+   before an unwrapper pulled it.
+
+   No queue setup is needed: on the first email the Worker creates
+   `email-outbox-dlq`, `email-outbox` (with itself as consumer, retries going
+   to the DLQ) and the agent's inbound queue through the Queues REST API.
 2. **Deploy**: either import this repository in **Workers & Pages → Create
    application → Import a repository** (Workers Builds; build command
    `npm run check && npm test`, deploy command `npx wrangler deploy`), or run
@@ -115,7 +125,9 @@ not be removed after a rejected delivery.
 3. **Secrets** (Worker → Settings → Variables and Secrets, type Secret, or
    `npx wrangler secret put <name>`):
    - `CF_ACCOUNT_ID`: the account id that owns the queues;
-   - `CF_API_TOKEN`: an API token with **Queues Edit** on that account.
+   - `CF_API_TOKEN`: an API token with **Queues Edit** on that account; the
+     Worker uses it to create the outbox and agent queues and their
+     consumers, and to push inbound messages.
 
    Both are secrets rather than `[vars]`, so deployments do not reset them.
 4. **Observability**: Workers Logs are enabled in `wrangler.toml`.

@@ -60,13 +60,27 @@ async function findQueue(config: QueuesApiConfig, name: string): Promise<QueueIn
   }
 }
 
+/** Body of `POST /queues/{id}/consumers`. */
+export type QueueConsumer =
+  | { type: "http_pull"; settings: { visibility_timeout_ms: number; max_retries: number } }
+  | {
+      type: "worker";
+      script_name: string;
+      dead_letter_queue?: string;
+      settings: { batch_size: number; max_retries: number };
+    };
+
 /**
- * Returns the id of queue `name`, creating it when missing and adding the
- * http_pull consumer when the queue has none. Ids are cached only once the
- * consumer is known to exist, so a half-finished setup is repaired by the
- * next email.
+ * Returns the id of queue `name`, creating it when missing and, when
+ * `consumer` is given, adding it if the queue has no consumer. Ids are cached
+ * only once the consumer is known to exist, so a half-finished setup is
+ * repaired by the next email.
  */
-export async function ensureQueue(config: QueuesApiConfig, name: string): Promise<string> {
+export async function ensureQueue(
+  config: QueuesApiConfig,
+  name: string,
+  consumer: QueueConsumer | undefined,
+): Promise<string> {
   const cacheKey = `${config.accountId}/${name}`;
   const cached = queueIds.get(cacheKey);
   if (cached) return cached;
@@ -81,12 +95,9 @@ export async function ensureQueue(config: QueuesApiConfig, name: string): Promis
       if (!queue) throw createError;
     }
   }
-  if (!queue.consumers?.length) {
+  if (consumer && !queue.consumers?.length) {
     try {
-      await call(config, "POST", `/queues/${queue.queue_id}/consumers`, {
-        type: "http_pull",
-        settings: { visibility_timeout_ms: 120000, max_retries: 5 },
-      });
+      await call(config, "POST", `/queues/${queue.queue_id}/consumers`, consumer);
     } catch (consumerError) {
       // A concurrent email may have added the consumer first.
       if (!(await findQueue(config, name))?.consumers?.length) throw consumerError;

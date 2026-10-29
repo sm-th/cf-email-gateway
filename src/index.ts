@@ -1,5 +1,5 @@
 import { EmailMessage } from "cloudflare:email";
-import { ensureQueue, pushMessage, type QueuesApiConfig } from "./cloudflare-queues";
+import { ensureQueue, pushMessage, type QueueConsumer, type QueuesApiConfig } from "./cloudflare-queues";
 import { queueName } from "./queue-name";
 
 export interface Env {
@@ -29,6 +29,22 @@ export interface OutboxMessage {
 }
 
 const REJECT_REASON = "Mailbox temporarily unavailable";
+
+/** Must match `name` in wrangler.toml: the outbox consumer runs this script. */
+const WORKER_NAME = "cf-email-gateway";
+const OUTBOX_QUEUE = "email-outbox";
+const OUTBOX_DLQ = "email-outbox-dlq";
+
+const AGENT_QUEUE_CONSUMER: QueueConsumer = {
+  type: "http_pull",
+  settings: { visibility_timeout_ms: 120000, max_retries: 5 },
+};
+const OUTBOX_CONSUMER: QueueConsumer = {
+  type: "worker",
+  script_name: WORKER_NAME,
+  dead_letter_queue: OUTBOX_DLQ,
+  settings: { batch_size: 10, max_retries: 5 },
+};
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -72,7 +88,11 @@ export default {
       r2Key = key;
 
       const api: QueuesApiConfig = { accountId: env.CF_ACCOUNT_ID, apiToken: env.CF_API_TOKEN };
-      const queueId = await ensureQueue(api, queue);
+      // The outbox queues are created here rather than in wrangler.toml so that
+      // deploying does not depend on them already existing.
+      await ensureQueue(api, OUTBOX_DLQ, undefined);
+      await ensureQueue(api, OUTBOX_QUEUE, OUTBOX_CONSUMER);
+      const queueId = await ensureQueue(api, queue, AGENT_QUEUE_CONSUMER);
       const body: InboundMessage = { version: 1, r2Key: key, from, to, receivedAt, size: raw.byteLength };
       await pushMessage(api, queueId, body);
       log("queued", { from, to, queue, r2Key: key, size: raw.byteLength });
