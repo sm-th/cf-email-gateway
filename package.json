@@ -6,11 +6,10 @@
   "private": true,
   "scripts": {
     "dev": "wrangler dev",
-    "deploy": "sh scripts/provision.sh && wrangler deploy",
+    "deploy": "wrangler deploy",
     "test": "vitest run",
     "test:watch": "vitest",
-    "check": "tsc --noEmit",
-    "provision": "sh scripts/provision.sh"
+    "check": "tsc --noEmit"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20260922.1",

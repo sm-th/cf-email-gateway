@@ -96,32 +96,33 @@ not be removed after a rejected delivery.
 
 ## Operator setup
 
-1. **Deploy**: either import this repository in **Workers & Pages → Create
+1. **Account resources**, once per account before the first deployment:
+
+   ```sh
+   npx wrangler queues create email-outbox
+   npx wrangler queues create email-outbox-dlq
+   npx wrangler r2 bucket create email-agents
+   npx wrangler r2 bucket lifecycle add email-agents expire-agent-mail --expire-days 3
+   ```
+
+   The lifecycle rule is a safety net for mail whose queue entry expired
+   before an unwrapper pulled it. Per-agent inbound queues are created by the
+   Worker on the first email.
+2. **Deploy**: either import this repository in **Workers & Pages → Create
    application → Import a repository** (Workers Builds; build command
-   `npm run check && npm test`, deploy command `npm run deploy`), or run
-   `npm install && npm run deploy` locally.
-
-   `npm run deploy` first runs `scripts/provision.sh`, which creates whatever
-   is missing and leaves existing resources unchanged:
-   - queues `email-outbox` and `email-outbox-dlq`;
-   - R2 bucket `email-agents` with the lifecycle rule `expire-agent-mail`
-     (objects expire after 3 days, a safety net for mail whose queue entry
-     expired before an unwrapper pulled it).
-
-   The deploying token therefore needs Queues Edit and R2 Edit in addition to
-   Workers permissions. Per-agent inbound queues are created by the Worker on
-   the first email.
-2. **Secrets** (Worker → Settings → Variables and Secrets, type Secret, or
+   `npm run check && npm test`, deploy command `npx wrangler deploy`), or run
+   `npm install && npx wrangler deploy` locally.
+3. **Secrets** (Worker → Settings → Variables and Secrets, type Secret, or
    `npx wrangler secret put <name>`):
    - `CF_ACCOUNT_ID`: the account id that owns the queues;
    - `CF_API_TOKEN`: an API token with **Queues Edit** on that account.
 
    Both are secrets rather than `[vars]`, so deployments do not reset them.
-3. **Observability**: Workers Logs are enabled in `wrangler.toml`.
-4. **Email Routing**: on the mail domain, add one custom address rule per
+4. **Observability**: Workers Logs are enabled in `wrangler.toml`.
+5. **Email Routing**: on the mail domain, add one custom address rule per
    whitelisted agent address with the action "Send to a Worker" →
    `cf-email-gateway`. Do not use a catch-all rule.
-5. **Recipients**: add every address that agents may reply to as a verified
+6. **Recipients**: add every address that agents may reply to as a verified
    destination address in Email Routing; `send_email` only delivers to
    verified addresses.
 
