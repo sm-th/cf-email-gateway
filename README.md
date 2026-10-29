@@ -101,10 +101,17 @@ not be removed after a rejected delivery.
    messages whose queue entry expired unprocessed.
 2. **Queues**: create `email-outbox` and `email-outbox-dlq`. Per-agent
    inbound queues are created automatically by the Worker.
-3. **API token**: create a token with **Queues Edit** permission on the
-   account and store it as a secret: `npx wrangler secret put CF_API_TOKEN`.
-4. **Account id**: set `CF_ACCOUNT_ID` under `[vars]` in `wrangler.toml`.
-5. **Deploy**: `npm install && npm run deploy`.
+3. **Deploy**: either import this repository in **Workers & Pages → Create
+   application → Import a repository** (Workers Builds; build command
+   `npm run check && npm test`, deploy command `npx wrangler deploy`), or run
+   `npm install && npx wrangler deploy` locally.
+4. **Secrets** (Worker → Settings → Variables and Secrets, type Secret, or
+   `npx wrangler secret put <name>`):
+   - `CF_ACCOUNT_ID`: the account id that owns the queues;
+   - `CF_API_TOKEN`: an API token with **Queues Edit** on that account.
+
+   Both are secrets rather than `[vars]`, so deployments do not reset them.
+5. **Observability**: Workers Logs are enabled in `wrangler.toml`.
 6. **Email Routing**: on the mail domain, add one custom address rule per
    whitelisted agent address with the action "Send to a Worker" →
    `cf-email-gateway`. Do not use a catch-all rule.

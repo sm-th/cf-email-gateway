@@ -21,9 +21,7 @@ name = "EMAIL"
 enabled = true
 invocation_logs = true
 
-[vars]
-# Cloudflare account id that owns the per-agent inbound queues.
-CF_ACCOUNT_ID = ""
-
-# Runtime secret configured with `wrangler secret put` or in the dashboard:
-#   CF_API_TOKEN  API token with "Queues Edit" on this account
+# Runtime secrets configured with `wrangler secret put` or in the dashboard.
+# They are secrets rather than [vars] so that deployments do not reset them:
+#   CF_ACCOUNT_ID  Cloudflare account id that owns the per-agent inbound queues
+#   CF_API_TOKEN   API token with "Queues Edit" on this account
