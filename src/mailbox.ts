@@ -174,9 +174,12 @@ export class Mailbox extends DurableObject<Env> {
     const raw = bytes.subarray(newline + 1);
     try {
       if (!from) throw new Error("mailbox address unknown");
-      await this.env.EMAIL.send(new EmailMessage(from, to, new Response(raw).body!));
-      log("sent", { mailbox: from, id, to, size: raw.byteLength });
-      sendJson(ws, { type: "sent", id });
+      // Cloudflare replaces the Message-ID header; report the one the recipient sees.
+      const { messageId } = await this.env.EMAIL.send(
+        new EmailMessage(from, to, new Response(raw).body!),
+      );
+      log("sent", { mailbox: from, id, to, size: raw.byteLength, messageId });
+      sendJson(ws, { type: "sent", id, messageId });
     } catch (error) {
       log("send_failed", { mailbox: from, id, to, size: raw.byteLength, error: errorMessage(error) });
       sendJson(ws, { type: "error", id, message: errorMessage(error) });

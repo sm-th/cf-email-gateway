@@ -297,7 +297,8 @@ describe("outbound mail", () => {
     const address = freshAddress();
     const guardian = await connect(address);
     guardian.ws.send(concat({ type: "send", id: "r1", to: SENDER }, reply(address, SENDER)));
-    expect(await guardian.nextJson()).toEqual({ type: "sent", id: "r1" });
+    const sent = await guardian.nextJson();
+    expect(sent).toEqual({ type: "sent", id: "r1", messageId: expect.stringMatching(/^<[^<>@\s]+@[^<>\s]+>$/) });
 
     // The local send_email binding rejects a From: header that differs from
     // the envelope sender, so the envelope sender is the mailbox address.
@@ -322,7 +323,7 @@ describe("outbound mail", () => {
     const guardian = await connect(address);
     await evictDurableObject(env.MAILBOX.get(env.MAILBOX.idFromName(address)));
     guardian.ws.send(concat({ type: "send", id: "r1", to: SENDER }, reply(address, SENDER)));
-    expect(await guardian.nextJson()).toEqual({ type: "sent", id: "r1" });
+    expect(await guardian.nextJson()).toMatchObject({ type: "sent", id: "r1" });
   });
 
   it("answers unparseable frames with an error without id", async () => {

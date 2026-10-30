@@ -122,7 +122,7 @@ A binary frame is a UTF-8 JSON header, `\n`, then raw bytes.
 | Mailbox → guardian | binary | `{"type":"mail","id":"<uuid>","from":"<envelope from>","to":"<address>","receivedAt":"<ISO 8601>","size":<raw byte length>}` + raw `.eml` |
 | guardian → Mailbox | text | `{"type":"ack","id":"<mail id>"}`: deletes the mail; unknown ids are ignored; no reply |
 | guardian → Mailbox | binary | `{"type":"send","id":"<client-chosen id>","to":"<recipient>"}` + raw reply `.eml` |
-| Mailbox → guardian | text | `{"type":"sent","id":"…"}` or `{"type":"error","id":"…","message":"…"}` in answer to `send` |
+| Mailbox → guardian | text | `{"type":"sent","id":"…","messageId":"<…>"}` (the Message-ID the recipient sees: Cloudflare replaces the header) or `{"type":"error","id":"…","message":"…"}` in answer to `send` |
 | Mailbox → guardian | text | `{"type":"error","id":null,"message":"…"}` for an unparseable frame |
 
 A reply is sent with `new EmailMessage(<address>, <to>, raw)`: envelope
