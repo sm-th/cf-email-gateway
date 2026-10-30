@@ -17,5 +17,9 @@
     "typescript": "^5.9.2",
     "vitest": "^4.1.12",
     "wrangler": "^4.38.0"
+  },
+  "dependencies": {
+    "asn1js": "^4.0.0",
+    "pkijs": "^4.0.1"
   }
 }

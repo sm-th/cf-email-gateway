@@ -1,3 +1,5 @@
+import type { Certificate } from "pkijs";
+import { parseCaCertificates, SIGNATURE_HEADER, verifyMailboxSignature } from "./auth";
 import { errorMessage, log } from "./log";
 import { ADDRESS_HEADER, type Env } from "./mailbox";
 
@@ -7,18 +9,8 @@ export type { Env } from "./mailbox";
 const REJECT_REASON = "Mailbox temporarily unavailable";
 const MAILBOX_PATH = /^\/mailbox\/([^/]+)$/;
 
-const encoder = new TextEncoder();
-
-/** Checks `token` against lowercase hex HMAC-SHA256(secret, address) in constant time. */
-async function tokenValid(secret: string, address: string, token: string): Promise<boolean> {
-  const key = await crypto.subtle.importKey("raw", encoder.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, [
-    "sign",
-  ]);
-  const mac = new Uint8Array(await crypto.subtle.sign("HMAC", key, encoder.encode(address)));
-  const expected = encoder.encode(Array.from(mac, (b) => b.toString(16).padStart(2, "0")).join(""));
-  const given = encoder.encode(token);
-  return given.byteLength === expected.byteLength && crypto.subtle.timingSafeEqual(given, expected);
-}
+/** Parsed `CA_CERT`, kept while the secret is unchanged. */
+let trust: { pem: string; certificates: Certificate[] } | undefined;
 
 export default {
   async email(message: ForwardableEmailMessage, env: Env): Promise<void> {
@@ -44,16 +36,28 @@ export default {
       // Malformed percent-encoding: treated as an unknown path.
     }
     if (!address) return new Response("Not found", { status: 404 });
-    if (!env.GATEWAY_SECRET) return new Response("GATEWAY_SECRET is not configured", { status: 500 });
-
-    const token = /^Bearer (.+)$/.exec(request.headers.get("Authorization") ?? "")?.[1] ?? "";
-    if (!(await tokenValid(env.GATEWAY_SECRET, address, token))) return new Response("Unauthorized", { status: 401 });
     if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
       return new Response("Expected a WebSocket upgrade", { status: 426, headers: { Upgrade: "websocket" } });
     }
+    if (!env.CA_CERT) return new Response("CA_CERT is not configured", { status: 500 });
+    if (trust?.pem !== env.CA_CERT) {
+      try {
+        trust = { pem: env.CA_CERT, certificates: parseCaCertificates(env.CA_CERT) };
+      } catch (error) {
+        log("config_error", { error: errorMessage(error) });
+        return new Response("CA_CERT is not a PEM certificate", { status: 500 });
+      }
+    }
+
+    const signature = request.headers.get(SIGNATURE_HEADER);
+    const verified = await verifyMailboxSignature(address, signature, trust.certificates, new Date());
+    if (!verified.ok) {
+      log("auth_failed", { address, reason: verified.reason });
+      return new Response("unauthorized", { status: 401 });
+    }
 
     const headers = new Headers(request.headers);
-    headers.delete("Authorization");
+    headers.delete(SIGNATURE_HEADER);
     headers.set(ADDRESS_HEADER, address);
     return env.MAILBOX.get(env.MAILBOX.idFromName(address)).fetch(new Request(request, { headers }));
   },
