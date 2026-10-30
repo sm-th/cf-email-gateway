@@ -1,444 +1,290 @@
-import { afterEach, beforeEach, describe, expect, it, type Mock, vi } from "vitest";
-import type { Env } from "../src/index";
-import { EmailMessage } from "./cloudflare-email";
+import { evictDurableObject } from "cloudflare:test";
+import { env, exports } from "cloudflare:workers";
+import { describe, expect, it, vi } from "vitest";
+import worker from "../src/index";
 
-const ACCOUNT = "acc123";
-const TOKEN = "token-xyz";
-const NOW = "2026-10-29T08:00:00.000Z";
-const UUID = "11111111-2222-4333-8444-555555555555";
-const PULL = [{ type: "http_pull" }];
-const WORKER_CONSUMER = {
-  type: "worker",
-  script_name: "cf-email-gateway",
-  dead_letter_queue: "email-outbox-dlq",
-  settings: { batch_size: 10, max_retries: 5 },
-};
+const encoder = new TextEncoder();
+const decoder = new TextDecoder();
+const SENDER = "author@example.com";
+const INBOUND = "From: author@example.com\r\nTo: agent@example.org\r\nSubject: hi\r\n\r\nhello\r\n";
 
-/** Fresh module per test, so the per-isolate queue id cache starts empty. */
-let worker: typeof import("../src/index").default;
-beforeEach(async () => {
-  vi.resetModules();
-  worker = (await import("../src/index")).default;
-});
-const RAW = "From: author@example.com\r\nTo: hermes@example.org\r\nSubject: hi\r\n\r\nhello\r\n";
+/** A fresh address per test, so no test sees another test's Mailbox. */
+const freshAddress = () => `agent-${crypto.randomUUID()}@example.org`;
 
-interface FakeQueue {
-  queue_id: string;
-  queue_name: string;
-  consumers?: { type: string }[];
+async function token(address: string, secret = "test-secret"): Promise<string> {
+  const key = await crypto.subtle.importKey("raw", encoder.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, [
+    "sign",
+  ]);
+  const mac = new Uint8Array(await crypto.subtle.sign("HMAC", key, encoder.encode(address)));
+  return Array.from(mac, (b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-interface ApiRequest {
-  method: string;
-  path: string;
-  body: unknown;
-  authorization: string | null;
+/** Delivers inbound mail through the Worker's `email` handler. */
+async function receive(to: string, raw: string | Uint8Array): Promise<void> {
+  const setReject = vi.fn();
+  const message = { from: SENDER, to, raw: new Response(raw).body!, setReject };
+  await worker.email(message as unknown as ForwardableEmailMessage, env);
+  expect(setReject).not.toHaveBeenCalled();
 }
 
-/** In-memory Cloudflare Queues API served through a stubbed global fetch. */
-function fakeCloudflare(options: {
-  queues?: FakeQueue[];
+function concat(header: Record<string, unknown>, raw: string | Uint8Array): Uint8Array {
+  const head = encoder.encode(`${JSON.stringify(header)}\n`);
+  const body = typeof raw === "string" ? encoder.encode(raw) : raw;
+  const frame = new Uint8Array(head.byteLength + body.byteLength);
+  frame.set(head);
+  frame.set(body, head.byteLength);
+  return frame;
+}
+
+function parseMail(frame: string | ArrayBuffer): { header: Record<string, unknown>; raw: Uint8Array } {
+  if (typeof frame === "string") throw new Error(`expected a binary frame, got ${frame}`);
+  const bytes = new Uint8Array(frame);
+  const newline = bytes.indexOf(0x0a);
+  return { header: JSON.parse(decoder.decode(bytes.subarray(0, newline))), raw: bytes.subarray(newline + 1) };
+}
+
+/** A guardian-side WebSocket that queues incoming frames. */
+class Guardian {
+  private readonly frames: (string | ArrayBuffer)[] = [];
+  private waiting?: () => void;
+  readonly closed: Promise<CloseEvent>;
+
+  constructor(readonly ws: WebSocket) {
+    ws.accept();
+    ws.addEventListener("message", (event) => {
+      this.frames.push(event.data);
+      this.waiting?.();
+    });
+    const closed = Promise.withResolvers<CloseEvent>();
+    ws.addEventListener("close", closed.resolve);
+    this.closed = closed.promise;
+  }
+
+  async next(): Promise<string | ArrayBuffer> {
+    while (this.frames.length === 0) {
+      const { promise, resolve } = Promise.withResolvers<void>();
+      this.waiting = resolve;
+      await promise;
+    }
+    return this.frames.shift()!;
+  }
+
+  async nextJson(): Promise<unknown> {
+    const frame = await this.next();
+    if (typeof frame !== "string") throw new Error("expected a text frame");
+    return JSON.parse(frame);
+  }
+
   /**
-   * State of email-outbox and email-outbox-dlq: "ready" (default) has both,
-   * the outbox with its Worker consumer; "bare" has both without consumers;
-   * "missing" has neither.
+   * Returns every frame received before the reply to a probe frame. The
+   * Mailbox handles one socket's frames in order, so earlier frames (and
+   * all mail sent on connect) arrive first.
    */
-  outbox?: "ready" | "bare" | "missing";
-  /** Another isolate creates the queue right before our create call. */
-  createConflict?: boolean;
-  pushError?: string;
-  consumerError?: string;
-}) {
-  const outbox = options.outbox ?? "ready";
-  const queues: FakeQueue[] = [
-    ...(outbox === "missing"
-      ? []
-      : [
-          { queue_id: "q-dlq", queue_name: "email-outbox-dlq", consumers: [] },
-          { queue_id: "q-outbox", queue_name: "email-outbox", consumers: outbox === "ready" ? [{ type: "worker" }] : [] },
-        ]),
-    ...(options.queues ?? []),
-  ];
-  const requests: ApiRequest[] = [];
-  const reply = (status: number, result: unknown, errors: { code: number; message: string }[] = []) =>
-    new Response(JSON.stringify({ success: status < 400, errors, messages: [], result }), { status });
-
-  vi.stubGlobal(
-    "fetch",
-    vi.fn(async (input: string, init: RequestInit = {}) => {
-      const url = new URL(input);
-      const prefix = `/client/v4/accounts/${ACCOUNT}`;
-      expect(url.origin + url.pathname.slice(0, prefix.length)).toBe(`https://api.cloudflare.com${prefix}`);
-      const path = url.pathname.slice(prefix.length);
-      const method = init.method ?? "GET";
-      const body = init.body ? JSON.parse(String(init.body)) : undefined;
-      requests.push({ method, path, body, authorization: new Headers(init.headers).get("authorization") });
-
-      if (method === "GET" && path === "/queues") return reply(200, queues);
-      const consumersPath = /^\/queues\/([^/]+)\/consumers$/.exec(path);
-      if (method === "POST" && consumersPath) {
-        if (options.consumerError) return reply(500, null, [{ code: 10001, message: options.consumerError }]);
-        queues.find((q) => q.queue_id === consumersPath[1])?.consumers?.push({ type: body.type });
-        return reply(200, { consumer_id: "c1" });
-      }
-      if (method === "POST" && path === "/queues") {
-        if (options.createConflict) {
-          queues.push({ queue_id: "q-other", queue_name: body.queue_name, consumers: [{ type: "http_pull" }] });
-          return reply(409, null, [{ code: 11009, message: "A queue with this name already exists" }]);
-        }
-        const created = { queue_id: `new-${body.queue_name}`, queue_name: body.queue_name, consumers: [] };
-        queues.push(created);
-        return reply(200, created);
-      }
-      if (method === "POST" && /^\/queues\/[^/]+\/messages$/.test(path)) {
-        return options.pushError ? reply(500, null, [{ code: 10001, message: options.pushError }]) : reply(200, null);
-      }
-      return reply(404, null, [{ code: 7003, message: `unexpected ${method} ${path}` }]);
-    }),
-  );
-  return requests;
+  async drain(): Promise<(string | ArrayBuffer)[]> {
+    this.ws.send("probe");
+    const before: (string | ArrayBuffer)[] = [];
+    for (;;) {
+      const frame = await this.next();
+      if (typeof frame === "string" && JSON.parse(frame).message === "expected an ack text frame") return before;
+      before.push(frame);
+    }
+  }
 }
 
-function fakeBucket() {
-  const objects = new Map<string, { bytes: Uint8Array; options: R2PutOptions | undefined }>();
-  const bucket = {
-    put: vi.fn(async (key: string, value: Uint8Array, options?: R2PutOptions) => {
-      objects.set(key, { bytes: value, options });
-    }),
-    delete: vi.fn(async (key: string) => {
-      objects.delete(key);
-    }),
-  };
-  return { objects, bucket };
+function mailboxRequest(path: string, headers: Record<string, string>): Promise<Response> {
+  return exports.default.fetch(new Request(`https://gateway.example${path}`, { headers }));
 }
 
-interface FakeInboundEmail {
-  from: string;
-  to: string;
-  raw: ReadableStream;
-  rawSize: number;
-  setReject: Mock;
-}
-
-function inboundEmail(to: string): FakeInboundEmail {
-  return {
-    from: "author@example.com",
-    to,
-    raw: new Response(RAW).body!,
-    rawSize: RAW.length,
-    setReject: vi.fn(),
-  };
-}
-
-function env(bucket: unknown, send?: (m: EmailMessage) => Promise<unknown>): Env {
-  return {
-    AGENT_MAIL: bucket as R2Bucket,
-    EMAIL: { send: vi.fn(send ?? (async () => ({}))) } as unknown as SendEmail,
-    CF_ACCOUNT_ID: ACCOUNT,
-    CF_API_TOKEN: TOKEN,
-  };
-}
-
-/** Drops the two outbox lookups that precede every first email in an isolate. */
-function afterOutboxLookups(requests: ApiRequest[]): ApiRequest[] {
-  expect(requests.slice(0, 2).map((r) => `${r.method} ${r.path}`)).toEqual(["GET /queues", "GET /queues"]);
-  return requests.slice(2);
-}
-
-async function receive(message: FakeInboundEmail, environment: Env) {
-  await worker.email(message as unknown as ForwardableEmailMessage, environment);
-}
-
-describe("email handler", () => {
-  beforeEach(() => {
-    vi.useFakeTimers({ toFake: ["Date"] });
-    vi.setSystemTime(new Date(NOW));
-    vi.spyOn(crypto, "randomUUID").mockReturnValue(UUID);
-    vi.spyOn(console, "log").mockImplementation(() => {});
-    vi.spyOn(console, "error").mockImplementation(() => {});
+async function connect(address: string): Promise<Guardian> {
+  const response = await mailboxRequest(`/mailbox/${encodeURIComponent(address)}`, {
+    Upgrade: "websocket",
+    Authorization: `Bearer ${await token(address)}`,
   });
-  afterEach(() => {
-    vi.useRealTimers();
+  expect(response.status).toBe(101);
+  return new Guardian(response.webSocket!);
+}
+
+describe("GET /mailbox/<address>", () => {
+  it("rejects a wrong, foreign or missing token with 401", async () => {
+    const address = freshAddress();
+    const path = `/mailbox/${address}`;
+    for (const authorization of [`Bearer ${await token(address, "other")}`, `Bearer ${await token(freshAddress())}`, ""]) {
+      const response = await mailboxRequest(path, { Upgrade: "websocket", Authorization: authorization });
+      expect(response.status).toBe(401);
+    }
   });
 
-  it("stores the message and pushes the contract body to an existing queue", async () => {
-    const requests = fakeCloudflare({ queues: [{ queue_id: "q-hermes", queue_name: "mail-hermes-example-org", consumers: PULL }] });
-    const { objects, bucket } = fakeBucket();
-    const message = inboundEmail("Hermes@Example.org");
+  it("requires a WebSocket upgrade with 426", async () => {
+    const address = freshAddress();
+    const response = await mailboxRequest(`/mailbox/${address}`, { Authorization: `Bearer ${await token(address)}` });
+    expect(response.status).toBe(426);
+  });
 
-    await receive(message, env(bucket));
+  it("answers 404 outside /mailbox/<address>", async () => {
+    for (const path of ["/", "/mailbox/", "/mailbox/a@example.org/x", "/other"]) {
+      expect((await mailboxRequest(path, {})).status).toBe(404);
+    }
+  });
 
-    const key = `mail-hermes-example-org/${NOW}-${UUID}.eml`;
-    const stored = objects.get(key);
-    expect(new TextDecoder().decode(stored?.bytes)).toBe(RAW);
-    expect(stored?.options).toEqual({
-      httpMetadata: { contentType: "message/rfc822" },
-      customMetadata: { from: "author@example.com", to: "Hermes@Example.org" },
+  it("answers 500 without GATEWAY_SECRET", async () => {
+    const request = new Request("https://gateway.example/mailbox/a@example.org", { headers: { Upgrade: "websocket" } });
+    const response = await worker.fetch(request, { ...env, GATEWAY_SECRET: undefined });
+    expect(response.status).toBe(500);
+  });
+
+  it("normalizes a percent-encoded, mixed-case address before checking the token", async () => {
+    const address = freshAddress();
+    const response = await mailboxRequest(`/mailbox/${encodeURIComponent(` ${address.toUpperCase()} `)}`, {
+      Upgrade: "websocket",
+      Authorization: `Bearer ${await token(address)}`,
     });
-    const pushes = requests.filter((r) => r.path.endsWith("/messages"));
-    expect(pushes).toEqual([
-      {
-        method: "POST",
-        path: "/queues/q-hermes/messages",
-        authorization: `Bearer ${TOKEN}`,
-        body: {
-          content_type: "json",
-          body: {
-            version: 1,
-            r2Key: key,
-            from: "author@example.com",
-            to: "Hermes@Example.org",
-            receivedAt: NOW,
-            size: RAW.length,
-          },
-        },
-      },
-    ]);
-    expect(requests.some((r) => r.method === "POST" && r.path.endsWith("/consumers"))).toBe(false);
-    expect(requests.some((r) => r.method === "POST" && r.path === "/queues")).toBe(false);
-    expect(message.setReject).not.toHaveBeenCalled();
-  });
-
-  it("caches the queue id so later emails skip the lookup", async () => {
-    const requests = fakeCloudflare({ queues: [{ queue_id: "q-cache", queue_name: "mail-cache-example-org", consumers: PULL }] });
-    const { bucket } = fakeBucket();
-
-    await receive(inboundEmail("cache@example.org"), env(bucket));
-    await receive(inboundEmail("cache@example.org"), env(bucket));
-
-    expect(afterOutboxLookups(requests).map((r) => `${r.method} ${r.path}`)).toEqual([
-      "GET /queues",
-      "POST /queues/q-cache/messages",
-      "POST /queues/q-cache/messages",
-    ]);
-  });
-
-  it("creates a missing queue with an http_pull consumer before pushing", async () => {
-    const requests = fakeCloudflare({ queues: [{ queue_id: "q-x", queue_name: "mail-someone-else" }] });
-    const { objects, bucket } = fakeBucket();
-    const message = inboundEmail("newbot@example.org");
-
-    await receive(message, env(bucket));
-
-    expect(afterOutboxLookups(requests).map((r) => [r.method, r.path, r.body])).toEqual([
-      ["GET", "/queues", undefined],
-      ["POST", "/queues", { queue_name: "mail-newbot-example-org" }],
-      [
-        "POST",
-        "/queues/new-mail-newbot-example-org/consumers",
-        { type: "http_pull", settings: { visibility_timeout_ms: 120000, max_retries: 5 } },
-      ],
-      ["POST", "/queues/new-mail-newbot-example-org/messages", expect.objectContaining({ content_type: "json" })],
-    ]);
-    expect(objects.size).toBe(1);
-    expect(message.setReject).not.toHaveBeenCalled();
-  });
-
-  it("adds the missing http_pull consumer to an existing queue and caches only afterwards", async () => {
-    const requests = fakeCloudflare({ queues: [{ queue_id: "q-bare", queue_name: "mail-bare-example-org", consumers: [] }] });
-    const { bucket } = fakeBucket();
-
-    await receive(inboundEmail("bare@example.org"), env(bucket));
-    await receive(inboundEmail("bare@example.org"), env(bucket));
-
-    expect(afterOutboxLookups(requests).map((r) => [r.method, r.path, r.body])).toEqual([
-      ["GET", "/queues", undefined],
-      [
-        "POST",
-        "/queues/q-bare/consumers",
-        { type: "http_pull", settings: { visibility_timeout_ms: 120000, max_retries: 5 } },
-      ],
-      ["POST", "/queues/q-bare/messages", expect.anything()],
-      ["POST", "/queues/q-bare/messages", expect.anything()],
-    ]);
-  });
-
-  it("retries the consumer setup on the next email when adding it failed", async () => {
-    const queues = [{ queue_id: "q-flaky", queue_name: "mail-flaky-example-org", consumers: [] as { type: string }[] }];
-    const requests = fakeCloudflare({ queues, consumerError: "temporary outage" });
-    const { bucket } = fakeBucket();
-    const first = inboundEmail("flaky@example.org");
-
-    await receive(first, env(bucket));
-    expect(first.setReject).toHaveBeenCalledOnce();
-
-    const requests2 = fakeCloudflare({ queues });
-    const second = inboundEmail("flaky@example.org");
-    await receive(second, env(bucket));
-
-    expect(second.setReject).not.toHaveBeenCalled();
-    expect(requests.filter((r) => r.path.endsWith("/messages"))).toEqual([]);
-    expect(requests2.map((r) => `${r.method} ${r.path}`)).toEqual([
-      "GET /queues",
-      "POST /queues/q-flaky/consumers",
-      "POST /queues/q-flaky/messages",
-    ]);
-  });
-
-  it("creates the outbox queues and the agent queue on the first email into an empty account", async () => {
-    const requests = fakeCloudflare({ outbox: "missing" });
-    const { bucket } = fakeBucket();
-    const message = inboundEmail("first@example.org");
-
-    await receive(message, env(bucket));
-
-    expect(requests.map((r) => [r.method, r.path, r.body])).toEqual([
-      ["GET", "/queues", undefined],
-      ["POST", "/queues", { queue_name: "email-outbox-dlq" }],
-      ["GET", "/queues", undefined],
-      ["POST", "/queues", { queue_name: "email-outbox" }],
-      ["POST", "/queues/new-email-outbox/consumers", WORKER_CONSUMER],
-      ["GET", "/queues", undefined],
-      ["POST", "/queues", { queue_name: "mail-first-example-org" }],
-      [
-        "POST",
-        "/queues/new-mail-first-example-org/consumers",
-        { type: "http_pull", settings: { visibility_timeout_ms: 120000, max_retries: 5 } },
-      ],
-      ["POST", "/queues/new-mail-first-example-org/messages", expect.objectContaining({ content_type: "json" })],
-    ]);
-    expect(message.setReject).not.toHaveBeenCalled();
-  });
-
-  it("adds the Worker consumer to an existing outbox queue that has none", async () => {
-    const requests = fakeCloudflare({
-      outbox: "bare",
-      queues: [{ queue_id: "q-agent", queue_name: "mail-agent-example-org", consumers: PULL }],
-    });
-    const { bucket } = fakeBucket();
-
-    await receive(inboundEmail("agent@example.org"), env(bucket));
-
-    expect(requests.filter((r) => r.path.endsWith("/consumers")).map((r) => [r.path, r.body])).toEqual([
-      ["/queues/q-outbox/consumers", WORKER_CONSUMER],
-    ]);
-  });
-
-  it("rejects the email when the outbox queue cannot be set up", async () => {
-    const requests = fakeCloudflare({ outbox: "bare", consumerError: "not allowed" });
-    const { objects, bucket } = fakeBucket();
-    const message = inboundEmail("agent@example.org");
-
-    await receive(message, env(bucket));
-
-    expect(message.setReject).toHaveBeenCalledOnce();
-    expect(objects.size).toBe(0);
-    expect(requests.some((r) => r.path.endsWith("/messages"))).toBe(false);
-  });
-
-  it("uses the queue created concurrently by another isolate when create conflicts", async () => {
-    const requests = fakeCloudflare({ createConflict: true });
-    const { objects, bucket } = fakeBucket();
-    const message = inboundEmail("racer@example.org");
-
-    await receive(message, env(bucket));
-
-    expect(afterOutboxLookups(requests).map((r) => `${r.method} ${r.path}`)).toEqual([
-      "GET /queues",
-      "POST /queues",
-      "GET /queues",
-      "POST /queues/q-other/messages",
-    ]);
-    expect(objects.size).toBe(1);
-    expect(message.setReject).not.toHaveBeenCalled();
-  });
-
-  it("deletes the stored object and rejects when the push fails", async () => {
-    fakeCloudflare({
-      queues: [{ queue_id: "q-fail", queue_name: "mail-fail-example-org", consumers: PULL }],
-      pushError: "Queue is overloaded",
-    });
-    const { objects, bucket } = fakeBucket();
-    const message = inboundEmail("fail@example.org");
-
-    await receive(message, env(bucket));
-
-    expect(bucket.put).toHaveBeenCalledOnce();
-    expect(bucket.delete).toHaveBeenCalledWith(`mail-fail-example-org/${NOW}-${UUID}.eml`);
-    expect(objects.size).toBe(0);
-    expect(message.setReject).toHaveBeenCalledOnce();
-    const logged = vi.mocked(console.error).mock.calls.map(([line]) => JSON.parse(String(line)));
-    expect(logged).toContainEqual(
-      expect.objectContaining({ event: "rejected", error: expect.stringContaining("10001: Queue is overloaded") }),
-    );
+    expect(response.status).toBe(101);
+    response.webSocket!.accept();
+    response.webSocket!.close();
   });
 });
 
-describe("outbox consumer", () => {
-  beforeEach(() => {
-    vi.spyOn(console, "log").mockImplementation(() => {});
-    vi.spyOn(console, "error").mockImplementation(() => {});
-  });
+describe("inbound mail", () => {
+  it("sends mail delivered before connecting on connect, with the exact header and bytes", async () => {
+    const address = freshAddress();
+    const before = Date.now();
+    await receive(address.toUpperCase(), INBOUND);
+    await receive(address, "second");
 
-  interface FakeQueueMessage {
-    id: string;
-    timestamp: Date;
-    body: unknown;
-    attempts: number;
-    ack: Mock;
-    retry: Mock;
-  }
-
-  function queueMessage(body: unknown): FakeQueueMessage {
-    return { id: "m1", timestamp: new Date(), body, attempts: 1, ack: vi.fn(), retry: vi.fn() };
-  }
-
-  async function consume(message: FakeQueueMessage, environment: Env) {
-    const batch = { queue: "email-outbox", messages: [message] } as unknown as MessageBatch<unknown>;
-    await worker.queue(batch, environment);
-  }
-
-  const reply = "From: hermes@example.org\r\nTo: author@example.com\r\n\r\n\u00e9\u00ff body\r\n";
-  const replyBytes = Uint8Array.from(reply, (c) => c.charCodeAt(0));
-  const validBody = {
-    version: 1,
-    from: "hermes@example.org",
-    to: "author@example.com",
-    raw: btoa(reply),
-  };
-
-  it("sends the decoded raw message unchanged and acks", async () => {
-    const sent: EmailMessage[] = [];
-    const environment = env(undefined, async (m) => sent.push(m));
-    const message = queueMessage(validBody);
-
-    await consume(message, environment);
-
-    expect(sent).toHaveLength(1);
-    expect(sent[0].from).toBe("hermes@example.org");
-    expect(sent[0].to).toBe("author@example.com");
-    expect(new Uint8Array(await new Response(sent[0].raw).arrayBuffer())).toEqual(replyBytes);
-    expect(message.ack).toHaveBeenCalledOnce();
-    expect(message.retry).not.toHaveBeenCalled();
-  });
-
-  it.each([
-    ["not an object", "hello"],
-    ["wrong version", { ...validBody, version: 2 }],
-    ["missing recipient", { ...validBody, to: "" }],
-    ["invalid base64", { ...validBody, raw: "@@not base64@@" }],
-  ])("acks without sending when the body is invalid (%s)", async (_, body) => {
-    const environment = env(undefined);
-    const message = queueMessage(body);
-
-    await consume(message, environment);
-
-    expect(environment.EMAIL.send).not.toHaveBeenCalled();
-    expect(message.ack).toHaveBeenCalledOnce();
-    expect(message.retry).not.toHaveBeenCalled();
-  });
-
-  it("retries when sending fails", async () => {
-    const environment = env(undefined, async () => {
-      throw new Error("destination address not verified");
+    const guardian = await connect(address);
+    const first = parseMail(await guardian.next());
+    expect(first.header).toEqual({
+      type: "mail",
+      id: expect.stringMatching(/^[0-9a-f-]{36}$/),
+      from: SENDER,
+      to: address,
+      receivedAt: expect.any(String),
+      size: encoder.encode(INBOUND).byteLength,
     });
-    const message = queueMessage(validBody);
+    expect(Date.parse(first.header.receivedAt as string)).toBeGreaterThanOrEqual(before - 1000);
+    expect(decoder.decode(first.raw)).toBe(INBOUND);
+    expect(decoder.decode(parseMail(await guardian.next()).raw)).toBe("second");
+  });
 
-    await consume(message, environment);
+  it("pushes mail that arrives while connected", async () => {
+    const address = freshAddress();
+    const guardian = await connect(address);
+    await receive(address, INBOUND);
+    const { header, raw } = parseMail(await guardian.next());
+    expect(header).toMatchObject({ type: "mail", from: SENDER, to: address });
+    expect(decoder.decode(raw)).toBe(INBOUND);
+  });
 
-    expect(message.retry).toHaveBeenCalledOnce();
-    expect(message.ack).not.toHaveBeenCalled();
-    const logged = vi.mocked(console.error).mock.calls.map(([line]) => JSON.parse(String(line)));
-    expect(logged).toContainEqual(expect.objectContaining({ event: "send_failed" }));
+  it("deletes acked mail and resends unacked mail on the next connection only", async () => {
+    const address = freshAddress();
+    await receive(address, "acked");
+    await receive(address, "unacked");
+
+    const first = await connect(address);
+    const [acked, unacked] = (await first.drain()).map(parseMail);
+    expect(decoder.decode(acked.raw)).toBe("acked");
+    first.ws.send(JSON.stringify({ type: "ack", id: acked.header.id }));
+    first.ws.send(JSON.stringify({ type: "ack", id: "unknown" }));
+    expect(await first.drain()).toEqual([]);
+    first.ws.close(1000);
+
+    const second = await connect(address);
+    const resent = (await second.drain()).map(parseMail);
+    expect(resent.map((mail) => mail.header.id)).toEqual([unacked.header.id]);
+  });
+
+  it("round-trips mail larger than a SQLite row byte for byte", async () => {
+    const address = freshAddress();
+    const raw = new Uint8Array(2.5 * 1024 * 1024 + 7);
+    for (let offset = 0; offset < raw.byteLength; offset += 65536) {
+      crypto.getRandomValues(raw.subarray(offset, offset + 65536));
+    }
+    await receive(address, raw);
+
+    const guardian = await connect(address);
+    const mail = parseMail(await guardian.next());
+    expect(mail.header.size).toBe(raw.byteLength);
+    expect(mail.raw.byteLength).toBe(raw.byteLength);
+    expect(mail.raw.every((byte, i) => byte === raw[i])).toBe(true);
+  });
+
+  it("drops mail older than 14 days when new mail arrives", async () => {
+    const address = freshAddress();
+    const stub = env.MAILBOX.get(env.MAILBOX.idFromName(address));
+    const old = new Date(Date.now() - 15 * 24 * 60 * 60 * 1000).toISOString();
+    await stub.deliver({ from: SENDER, to: address, receivedAt: old, raw: encoder.encode("old") });
+    await receive(address, "new");
+
+    const guardian = await connect(address);
+    expect((await guardian.drain()).map((frame) => decoder.decode(parseMail(frame).raw))).toEqual(["new"]);
+  });
+
+  it("rejects the SMTP transaction when the Mailbox fails", async () => {
+    const setReject = vi.fn();
+    const message = { from: SENDER, to: "a@example.org", raw: new Response("x").body!, setReject };
+    const failing = {
+      idFromName: () => ({}),
+      get: () => ({ deliver: () => Promise.reject(new Error("boom")) }),
+    } as unknown as typeof env.MAILBOX;
+    await worker.email(message as unknown as ForwardableEmailMessage, { ...env, MAILBOX: failing });
+    expect(setReject).toHaveBeenCalledWith("Mailbox temporarily unavailable");
+  });
+});
+
+describe("outbound mail", () => {
+  const reply = (from: string, to: string) =>
+    `From: ${from}\r\nTo: ${to}\r\nSubject: Re: hi\r\nMessage-ID: <${crypto.randomUUID()}@example.org>\r\n\r\nreply\r\n`;
+
+  it("sends a reply with the mailbox address as envelope sender and answers sent", async () => {
+    const address = freshAddress();
+    const guardian = await connect(address);
+    guardian.ws.send(concat({ type: "send", id: "r1", to: SENDER }, reply(address, SENDER)));
+    expect(await guardian.nextJson()).toEqual({ type: "sent", id: "r1" });
+
+    // The local send_email binding rejects a From: header that differs from
+    // the envelope sender, so the envelope sender is the mailbox address.
+    guardian.ws.send(concat({ type: "send", id: "r2", to: SENDER }, reply("other@example.org", SENDER)));
+    expect(await guardian.nextJson()).toEqual({
+      type: "error",
+      id: "r2",
+      message: expect.stringContaining("From: header does not match"),
+    });
+  });
+
+  it("answers error when sending fails", async () => {
+    const address = freshAddress();
+    const guardian = await connect(address);
+    const stranger = "stranger@example.net";
+    guardian.ws.send(concat({ type: "send", id: "r1", to: stranger }, reply(address, stranger)));
+    expect(await guardian.nextJson()).toEqual({ type: "error", id: "r1", message: `email to ${stranger} not allowed` });
+  });
+
+  it("still knows its address after eviction", async () => {
+    const address = freshAddress();
+    const guardian = await connect(address);
+    await evictDurableObject(env.MAILBOX.get(env.MAILBOX.idFromName(address)));
+    guardian.ws.send(concat({ type: "send", id: "r1", to: SENDER }, reply(address, SENDER)));
+    expect(await guardian.nextJson()).toEqual({ type: "sent", id: "r1" });
+  });
+
+  it("answers unparseable frames with an error without id", async () => {
+    const guardian = await connect(freshAddress());
+    for (const frame of ["not json", JSON.stringify({ type: "send", id: "x" }), encoder.encode("no header")]) {
+      guardian.ws.send(frame);
+      expect(await guardian.nextJson()).toMatchObject({ type: "error", id: null });
+    }
+  });
+});
+
+describe("connections", () => {
+  it("closes the older connection with 4000 replaced", async () => {
+    const address = freshAddress();
+    const first = await connect(address);
+    const second = await connect(address);
+    const event = await first.closed;
+    expect([event.code, event.reason]).toEqual([4000, "replaced"]);
+
+    await receive(address, INBOUND);
+    expect(decoder.decode(parseMail(await second.next()).raw)).toBe(INBOUND);
   });
 });
