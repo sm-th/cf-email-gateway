@@ -1,151 +1,149 @@
 # cf-email-gateway
 
-A Cloudflare Worker that connects Cloudflare Email Routing to per-agent
-Cloudflare Queues. Deploy one instance per mail domain.
+A Cloudflare Worker that connects Cloudflare Email Routing to the guardians of
+AI agents. Deploy one instance per mail domain.
+
+Each agent address gets its own SQLite-backed Durable Object, `Mailbox`
+(`idFromName(address)`). The agent's guardian (`cf-email-unwrapper`) keeps a
+WebSocket open to its Mailbox, receives inbound mail over it and sends replies
+back through it. Agents themselves only speak A2A; the guardian does all
+S/MIME and A2A work.
+
+```mermaid
+flowchart LR
+  sender[Sender] -->|SMTP| routing[Email Routing]
+  routing -->|email handler| worker[Worker]
+  worker -->|deliver| mailbox["Mailbox DO (per address)"]
+  guardian[Guardian] <-->|"WebSocket /mailbox/&lt;address&gt;"| mailbox
+  mailbox -->|send_email| recipient[Verified recipient]
+```
 
 ## What it does
 
-- **Inbound** (`email` handler): for every message Email Routing delivers to
-  the Worker, it stores the raw `.eml` bytes in the R2 bucket `email-agents`,
-  makes sure the agent's inbound queue exists (creating the queue and an
-  HTTP pull consumer on first use), and pushes a small reference message into
-  that queue. If anything fails after the object was written, the object is
-  deleted and the SMTP transaction is rejected.
-- **Outbound** (`queue` handler on `email-outbox`, attached as the queue's
-  consumer by the Worker itself, see below): decodes each finished
-  reply and sends it unchanged through the `send_email` binding. Malformed
-  queue messages are logged and dropped; send failures are retried and end up
-  in `email-outbox-dlq` after the retry limit.
+- **Inbound** (`email` handler): reads the raw message Email Routing delivers
+  and hands it to the Mailbox of the lowercased recipient address, which
+  stores it and pushes it to the connected guardian, if any. If the Mailbox
+  cannot take the message, the SMTP transaction is rejected with "Mailbox
+  temporarily unavailable".
+- **Guardian connection** (`fetch` handler, `GET /mailbox/<address>`): checks
+  the token and forwards the WebSocket upgrade to the Mailbox. On every new
+  connection the Mailbox sends all stored mail, oldest first.
+- **Outbound**: the guardian sends a finished reply over the WebSocket; the
+  Mailbox sends it unchanged through the `send_email` binding, with the
+  mailbox address as envelope sender.
 
 ## What it does not do
 
 - No S/MIME: it never decrypts, signs, encrypts or verifies anything and holds
   no keys.
 - No sender or signature checks. Email Routing only routes whitelisted agent
-  addresses to this Worker; everything else is verified by the consumer of the
-  inbound queue (the unwrapper).
+  addresses to this Worker; everything else is checked by the guardian.
 - No agent logic and no message parsing.
 
 ## Contract
 
-### Queue naming
+### Connection
 
-The inbound queue for an agent address is computed as follows (consumers must
-use the identical algorithm):
+```
+GET /mailbox/<address>
+Upgrade: websocket
+Authorization: Bearer <token>
+```
 
-1. `a = address.trim().toLowerCase()`
-2. `slug = a` with every run of characters outside `[a-z0-9]` replaced by a
-   single `-`, then leading and trailing `-` removed
-3. `name = "mail-" + slug`
-4. If `name` is longer than 63 characters:
-   `name = name[:54].rstrip("-") + "-" + sha256_hex(a)[:8]`, where the hash is
-   SHA-256 over the UTF-8 bytes of `a`, in lowercase hex.
+`<address>` may be percent-encoded; the Worker trims and lowercases it. The
+token is the lowercase hex HMAC-SHA256 of the lowercased address, keyed with
+the UTF-8 bytes of the Worker secret `GATEWAY_SECRET`; it is compared in
+constant time.
 
-Examples:
-
-| Address | Queue |
+| Condition | Response |
 | --- | --- |
-| `hermes@example.org` | `mail-hermes-example-org` |
-| `Hermes.Bot+x@Example.ORG` | `mail-hermes-bot-x-example-org` |
-| 70 × `a` + `@example.org` | `mail-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-0ffad590` |
+| Path other than `/mailbox/<address>` | 404 |
+| `GATEWAY_SECRET` not configured | 500 |
+| Missing or wrong token | 401 |
+| No `Upgrade: websocket` | 426 |
+| Otherwise | 101, WebSocket to the address's Mailbox |
 
-Every inbound queue gets one consumer of type `http_pull` with
-`visibility_timeout_ms = 120000` and `max_retries = 5`; the Worker adds it on
-the next email whenever it finds the queue without a consumer.
+A Mailbox keeps one connection: accepting a new socket closes older ones with
+code 4000, reason `replaced`. The guardian keeps the connection alive with
+WebSocket protocol pings, which Cloudflare answers without waking the Durable
+Object.
 
-Before pushing, the Worker also ensures `email-outbox-dlq` (no consumer) and
-`email-outbox` with a Worker consumer: script `cf-email-gateway`, dead letter
-queue `email-outbox-dlq`, `batch_size = 10`, `max_retries = 5`. The outbox
-queues are not declared in `wrangler.toml`, so deploying does not require them
-to exist. Queue ids are cached per isolate, so these checks normally cost no
-API calls.
+### Frames
 
-### Inbound queue message
+A binary frame is a UTF-8 JSON header, `\n`, then raw bytes.
 
-Pushed with `content_type: "json"` to `mail-<slug>`:
+| Direction | Frame | Content |
+| --- | --- | --- |
+| Mailbox → guardian | binary | `{"type":"mail","id":"<uuid>","from":"<envelope from>","to":"<address>","receivedAt":"<ISO 8601>","size":<raw byte length>}` + raw `.eml` |
+| guardian → Mailbox | text | `{"type":"ack","id":"<mail id>"}`: deletes the mail; unknown ids are ignored; no reply |
+| guardian → Mailbox | binary | `{"type":"send","id":"<client-chosen id>","to":"<recipient>"}` + raw reply `.eml` |
+| Mailbox → guardian | text | `{"type":"sent","id":"…"}` or `{"type":"error","id":"…","message":"…"}` in answer to `send` |
+| Mailbox → guardian | text | `{"type":"error","id":null,"message":"…"}` for an unparseable frame |
 
-```json
-{
-  "version": 1,
-  "r2Key": "mail-hermes-example-org/2026-10-29T08:00:00.000Z-<uuid>.eml",
-  "from": "<envelope MAIL FROM>",
-  "to": "<envelope RCPT TO>",
-  "receivedAt": "<ISO 8601>",
-  "size": 12345
-}
-```
+A reply is sent with `new EmailMessage(<address>, <to>, raw)`: envelope
+sender is the mailbox address, envelope recipient the header's `to`. The
+message's `From:` header must match the mailbox address and `to` must be a
+verified destination address.
 
-The object at `r2Key` in `email-agents` holds the raw message bytes
-(`Content-Type: message/rfc822`, custom metadata `from` and `to`). The queue
-consumer deletes the object once it has handled and acknowledged the message.
+### Guarantees
 
-### Outbox queue message
-
-Consumed from `email-outbox`:
-
-```json
-{
-  "version": 1,
-  "from": "hermes@example.org",
-  "to": "author@example.com",
-  "raw": "<base64 of the complete RFC 5322 message>"
-}
-```
-
-`raw` is the finished message; the gateway sends the decoded bytes as-is with
-`new EmailMessage(from, to, raw)`. `from` must be an address on the routing
-domain and `to` a verified destination address.
+- Delivery is at least once. Mail stays in the Mailbox until it is acked;
+  unacked mail is resent on the next connection only (not while the same
+  connection stays open). The guardian deduplicates by `Message-ID`.
+- Mail is kept for at most 14 days: every delivery first deletes stored mail
+  older than that.
 
 ### Logs
 
-One JSON line per event: `queued`, `rejected` (inbound); `sent`,
-`send_failed`, `discarded` (outbox); `cleanup_failed` if the R2 object could
-not be removed after a rejected delivery.
+One JSON line per event: `received` (id, from, to, size) and `rejected`
+(inbound); `sent` and `send_failed` (outbound); `push_failed` if a frame could
+not be written to the connected socket (the mail stays stored).
 
 ## Operator setup
 
-1. **R2 bucket**, once per account before the first deployment (the R2
-   binding must exist at deploy time):
+1. **Deploy** once: `npm install && npx wrangler deploy`, or import this
+   repository in **Workers & Pages → Create application → Import a
+   repository** (Workers Builds; build command `npm run check && npm test`,
+   deploy command `npx wrangler deploy`). The deployment creates the
+   `Mailbox` Durable Object class; nothing else has to exist beforehand.
+2. **Secret** `GATEWAY_SECRET` (Worker → Settings → Variables and Secrets,
+   type Secret, or `npx wrangler secret put GATEWAY_SECRET`), generated with:
 
    ```sh
-   npx wrangler r2 bucket create email-agents
-   npx wrangler r2 bucket lifecycle add email-agents expire-agent-mail --expire-days 3
+   openssl rand -hex 32
    ```
 
-   The lifecycle rule is a safety net for mail whose queue entry expired
-   before an unwrapper pulled it.
-
-   No queue setup is needed: on the first email the Worker creates
-   `email-outbox-dlq`, `email-outbox` (with itself as consumer, retries going
-   to the DLQ) and the agent's inbound queue through the Queues REST API.
-2. **Deploy**: either import this repository in **Workers & Pages → Create
-   application → Import a repository** (Workers Builds; build command
-   `npm run check && npm test`, deploy command `npx wrangler deploy`), or run
-   `npm install && npx wrangler deploy` locally.
-3. **Secrets** (Worker → Settings → Variables and Secrets, type Secret, or
-   `npx wrangler secret put <name>`):
-   - `CF_ACCOUNT_ID`: the account id that owns the queues;
-   - `CF_API_TOKEN`: an API token with **Queues Edit** on that account; the
-     Worker uses it to create the outbox and agent queues and their
-     consumers, and to push inbound messages.
-
-   Both are secrets rather than `[vars]`, so deployments do not reset them.
-4. **Observability**: Workers Logs are enabled in `wrangler.toml`.
-5. **Email Routing**: on the mail domain, add one custom address rule per
-   whitelisted agent address with the action "Send to a Worker" →
-   `cf-email-gateway`. Do not use a catch-all rule.
-6. **Recipients**: add every address that agents may reply to as a verified
+   It is a secret rather than a `[vars]` entry, so deployments do not reset
+   it. Rotating it invalidates every guardian token.
+3. **Email Routing**: on the mail domain, add one custom address rule per
+   agent address with the action "Send to a Worker" → `cf-email-gateway`. Do
+   not use a catch-all rule.
+4. **Recipients**: add every address that agents may reply to as a verified
    destination address in Email Routing; `send_email` only delivers to
    verified addresses.
+5. **Guardian token** for an agent address:
 
-## Limits
+   ```sh
+   printf %s hermes@example.org | openssl dgst -sha256 -hmac "$GATEWAY_SECRET" -r | cut -d' ' -f1
+   ```
 
-- A queue message is at most 128 KB. Inbound messages only carry a reference;
-  replies larger than that cannot pass through `email-outbox`.
-- Messages are retained for 24 hours on Workers Free (up to 14 days on Paid).
-  Inbound mail not pulled within that window is lost from the queue (the R2
-  object remains until the lifecycle rule removes it).
-- Delivery is at least once and unordered.
+   The address must be lowercase.
+6. **Observability**: Workers Logs are enabled in `wrangler.toml`.
+
+The previous transport's queues (`mail-*`, `email-outbox`,
+`email-outbox-dlq`) and R2 bucket `email-agents` are no longer used and can be
+deleted by hand, as can the old secrets `CF_ACCOUNT_ID` and `CF_API_TOKEN`.
+
+## Limits and costs
+
+- Email Routing caps inbound mail at 25 MiB. The Mailbox stores raw mail in
+  1 MiB SQLite chunks, because a SQLite row is limited to 2 MB.
+- A reply must fit into one WebSocket message, which Durable Objects accept up
+  to 32 MiB.
+- A connected guardian uses the WebSocket Hibernation API: an idle, hibernated
+  Durable Object is not billed for duration, and protocol pings do not wake it.
+  Costs come from requests (inbound mail, WebSocket messages) and SQLite
+  storage of mail not yet acked.
 
 ## Development
 
@@ -153,5 +151,10 @@ not be removed after a rejected delivery.
 nix develop      # optional: Node.js toolchain
 npm install
 npm run check    # tsc --noEmit
-npm test         # vitest
+npm test         # vitest in the Workers runtime (@cloudflare/vitest-plugin)
 ```
+
+The tests run the Worker and its Durable Object in a local workerd. Miniflare's
+`send_email` binding stands in for Email Routing: it checks that the `From:`
+header matches the envelope sender and only allows `author@example.com` as
+recipient (see `vitest.config.ts`).
