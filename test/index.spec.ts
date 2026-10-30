@@ -1,7 +1,9 @@
 import { evictDurableObject } from "cloudflare:test";
-import { env, exports } from "cloudflare:workers";
+import { env } from "cloudflare:workers";
 import { describe, expect, it, vi } from "vitest";
+import { mailboxChallenge } from "../src/auth";
 import worker from "../src/index";
+import { fixture, issueCertificate, signChallenge } from "./pki";
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -11,13 +13,7 @@ const INBOUND = "From: author@example.com\r\nTo: agent@example.org\r\nSubject: h
 /** A fresh address per test, so no test sees another test's Mailbox. */
 const freshAddress = () => `agent-${crypto.randomUUID()}@example.org`;
 
-async function token(address: string, secret = "test-secret"): Promise<string> {
-  const key = await crypto.subtle.importKey("raw", encoder.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, [
-    "sign",
-  ]);
-  const mac = new Uint8Array(await crypto.subtle.sign("HMAC", key, encoder.encode(address)));
-  return Array.from(mac, (b) => b.toString(16).padStart(2, "0")).join("");
-}
+const CA_CERT = fixture("ca.crt.pem");
 
 /** Delivers inbound mail through the Worker's `email` handler. */
 async function receive(to: string, raw: string | Uint8Array): Promise<void> {
@@ -91,32 +87,78 @@ class Guardian {
   }
 }
 
-function mailboxRequest(path: string, headers: Record<string, string>): Promise<Response> {
-  return exports.default.fetch(new Request(`https://gateway.example${path}`, { headers }));
+/** A request through the Worker's `fetch` handler, with the test CA as `CA_CERT` unless `overrides` replace it. */
+function mailboxRequest(path: string, headers: Record<string, string>, overrides: Partial<typeof env> = {}) {
+  const request = new Request(`https://gateway.example${path}`, { headers });
+  return worker.fetch(request, { ...env, CA_CERT, ...overrides });
+}
+
+/** The `auth_failed` reasons logged since `spy` was installed. */
+function authFailures(spy: { mock: { calls: unknown[][] } }): string[] {
+  return spy.mock.calls
+    .map(([line]) => JSON.parse(String(line)) as { event: string; reason?: string })
+    .filter((entry) => entry.event === "auth_failed")
+    .map((entry) => String(entry.reason));
 }
 
 async function connect(address: string): Promise<Guardian> {
   const response = await mailboxRequest(`/mailbox/${encodeURIComponent(address)}`, {
     Upgrade: "websocket",
-    Authorization: `Bearer ${await token(address)}`,
+    "X-Mailbox-Signature": await signChallenge(address),
   });
   expect(response.status).toBe(101);
   return new Guardian(response.webSocket!);
 }
 
 describe("GET /mailbox/<address>", () => {
-  it("rejects a wrong, foreign or missing token with 401", async () => {
+  it("connects a guardian whose certificate the CA issued for the address, and delivers its mail", async () => {
     const address = freshAddress();
-    const path = `/mailbox/${address}`;
-    for (const authorization of [`Bearer ${await token(address, "other")}`, `Bearer ${await token(freshAddress())}`, ""]) {
-      const response = await mailboxRequest(path, { Upgrade: "websocket", Authorization: authorization });
-      expect(response.status).toBe(401);
+    const guardian = await connect(address);
+    await receive(address, INBOUND);
+    expect(decoder.decode(parseMail(await guardian.next()).raw)).toBe(INBOUND);
+  });
+
+  it("rejects a missing or invalid signature with 401 and logs why", async () => {
+    const address = freshAddress();
+    const other = freshAddress();
+    const minutesAgo = (minutes: number) => new Date(Date.now() - minutes * 60_000);
+    const cases: [string, string | undefined, RegExp][] = [
+      ["missing header", undefined, /missing X-Mailbox-Signature/],
+      ["not base64", "%%%", /not base64/],
+      ["not CMS", btoa("hello"), /malformed signature/],
+      [
+        "certificate for another address",
+        await signChallenge(address, { signer: await issueCertificate(other) }),
+        /not issued for the mailbox address/,
+      ],
+      [
+        "certificate from another CA",
+        await signChallenge(address, { signer: await issueCertificate(address, { issuer: "rogue-ca" }) }),
+        /signature is not valid/,
+      ],
+      [
+        "signature over another address",
+        await signChallenge(address, { content: mailboxChallenge(other) }),
+        /signature is not valid: .*digest/,
+      ],
+      ["stale signingTime", await signChallenge(address, { signingTime: minutesAgo(6) }), /more than 5 minutes/],
+      ["no signingTime", await signChallenge(address, { signingTime: null }), /no signingTime/],
+    ];
+    for (const [name, signature, reason] of cases) {
+      const error = vi.spyOn(console, "error").mockImplementation(() => {});
+      const headers: Record<string, string> = { Upgrade: "websocket" };
+      if (signature !== undefined) headers["X-Mailbox-Signature"] = signature;
+      const response = await mailboxRequest(`/mailbox/${address}`, headers);
+      expect(response.status, name).toBe(401);
+      expect(await response.text(), name).toBe("unauthorized");
+      expect(authFailures(error), name).toEqual([expect.stringMatching(reason)]);
+      error.mockRestore();
     }
   });
 
   it("requires a WebSocket upgrade with 426", async () => {
     const address = freshAddress();
-    const response = await mailboxRequest(`/mailbox/${address}`, { Authorization: `Bearer ${await token(address)}` });
+    const response = await mailboxRequest(`/mailbox/${address}`, { "X-Mailbox-Signature": await signChallenge(address) });
     expect(response.status).toBe(426);
   });
 
@@ -126,17 +168,33 @@ describe("GET /mailbox/<address>", () => {
     }
   });
 
-  it("answers 500 without GATEWAY_SECRET", async () => {
-    const request = new Request("https://gateway.example/mailbox/a@example.org", { headers: { Upgrade: "websocket" } });
-    const response = await worker.fetch(request, { ...env, GATEWAY_SECRET: undefined });
-    expect(response.status).toBe(500);
+  it("answers 500 without a usable CA_CERT", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const address = freshAddress();
+    const headers = { Upgrade: "websocket", "X-Mailbox-Signature": await signChallenge(address) };
+    for (const caCert of [undefined, "", "not a certificate", "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----"]) {
+      expect((await mailboxRequest(`/mailbox/${address}`, headers, { CA_CERT: caCert })).status).toBe(500);
+    }
   });
 
-  it("normalizes a percent-encoded, mixed-case address before checking the token", async () => {
+  it("accepts a single-line CA_CERT and a CA_CERT with several certificates", async () => {
+    const address = freshAddress();
+    const singleLine = CA_CERT.trim().replace(/\n/g, " ");
+    const bundle = `${fixture("rogue-ca.crt.pem")}${CA_CERT}`;
+    for (const caCert of [singleLine, bundle]) {
+      const headers = { Upgrade: "websocket", "X-Mailbox-Signature": await signChallenge(address) };
+      const response = await mailboxRequest(`/mailbox/${address}`, headers, { CA_CERT: caCert });
+      expect(response.status).toBe(101);
+      response.webSocket!.accept();
+      response.webSocket!.close();
+    }
+  });
+
+  it("normalizes a percent-encoded, mixed-case address before checking the signature", async () => {
     const address = freshAddress();
     const response = await mailboxRequest(`/mailbox/${encodeURIComponent(` ${address.toUpperCase()} `)}`, {
       Upgrade: "websocket",
-      Authorization: `Bearer ${await token(address)}`,
+      "X-Mailbox-Signature": await signChallenge(address),
     });
     expect(response.status).toBe(101);
     response.webSocket!.accept();

@@ -6,7 +6,6 @@ export default defineConfig({
     cloudflareTest({
       wrangler: { configPath: "./wrangler.toml" },
       miniflare: {
-        bindings: { GATEWAY_SECRET: "test-secret" },
         // Miniflare's local send_email binding validates the message (From:
         // header must equal the envelope sender) and rejects recipients that
         // are not listed here, which stands in for unverified addresses.

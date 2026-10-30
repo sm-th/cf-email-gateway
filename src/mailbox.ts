@@ -5,7 +5,8 @@ import { errorMessage, log } from "./log";
 export interface Env {
   MAILBOX: DurableObjectNamespace<Mailbox>;
   EMAIL: SendEmail;
-  GATEWAY_SECRET?: string;
+  /** PEM certificate(s) of the CA that issues guardians' signing certificates. */
+  CA_CERT?: string;
 }
 
 /** Inbound mail handed to {@link Mailbox.deliver} by the `email` handler. */

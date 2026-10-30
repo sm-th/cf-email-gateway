@@ -18,7 +18,9 @@ name = "EMAIL"
 enabled = true
 invocation_logs = true
 
-# Runtime secret, configured with `wrangler secret put GATEWAY_SECRET` or in the
+# Runtime secret, configured with `wrangler secret put CA_CERT` or in the
 # dashboard (a secret rather than [vars], so deployments do not reset it):
-#   GATEWAY_SECRET  HMAC key for the per-address WebSocket tokens
-#                   (bearer token = hex HMAC-SHA256(GATEWAY_SECRET, address))
+#   CA_CERT  PEM certificate(s) of the CA that issues the guardians' signing
+#            certificates; not confidential, the gateway holds no private key.
+#            Guardians authenticate with a CMS signature by a certificate this
+#            CA issued for the mailbox address (see README).
